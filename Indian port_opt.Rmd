@@ -1,0 +1,419 @@
+---
+title: "Dynamic Copula based portfolio optimization: India"
+output: html_document
+date: "2024-11-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+This report presents a small empirical analysis of daily returns for ten Indian assets: RELIANCE.NS, TCS.NS, INFY.NS, HDFCBANK.NS, ICICIBANK.NS, HINDUNILVR.NS, ITC.NS, KOTAKBANK.NS, LT.NS, and SBIN.NS.
+
+The dataset spans January 2022 to January 2024, and the analysis uses a 470-day rolling window for return calculations. This window size balances computational efficiency and reduce running time. However, the window size can be adjusted based on specific analysis requirements.
+```{r cars}
+# Clear environment
+rm(list = ls())
+gc()
+
+## load necessary libraries
+library(copula)
+library(sgt)
+library(quantmod)
+library(PerformanceAnalytics)## for var and cvar
+library(quadprog)
+library(zoo)
+library(doParallel)
+library(parallel)
+library(foreach)
+library(corrplot)
+library(ggplot2)
+library(reshape2)
+library(ggpubr)
+library(ADGofTest)## for ad.test
+
+#track running time
+strt=Sys.time()
+
+# Set up parallel backend
+num_cores <- detectCores() - 1  # Leave one core free
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Fetch historical stock prices
+asset_names <- c("RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
+                 "HINDUNILVR.NS", "ITC.NS", "KOTAKBANK.NS", "LT.NS", "SBIN.NS")
+
+getSymbols(asset_names, from = "2022-01-01", to = "2024-01-01")
+
+# Initialize an empty list to store returns
+returns_list <- list()
+
+# Loop through each asset to calculate log returns
+for (ticker in asset_names) {
+  returns_list[[ticker]] <- na.omit(100 * diff(log(Ad(get(ticker)))))
+}
+
+# Combine all returns into a matrix
+returns_matrix <- coredata(do.call(merge, c(returns_list, all = FALSE)))
+colnames(returns_matrix) <- asset_names
+
+### some values which user can change as per the need
+window_size <-470
+##sample size m
+m=5*10^5
+
+d=length(asset_names)
+num_windows <- nrow(returns_matrix) - window_size+1
+
+
+##***++++==correlation heat map to see the portfolio dependence structure&&&***+++
+# Correlation matrix
+cor_matrix <- cor(returns_matrix)
+# Plot the correlation matrix as a heatmap
+corrplot(cor_matrix, method = "color", tl.cex = 0.7, addCoef.col = "black", number.cex = 0.5,  )
+
+###*** Define the fitting marginal sgt function&&**$$$$
+###*** Fit empirical checkerboard copula&&***
+fit.empirical_checkerboard_copula <- function(log_returns_matrix) {
+  # Preallocate uniform marginals
+  uniform_marginals <- matrix(NA, nrow = nrow(log_returns_matrix), 
+                              ncol = d)
+  
+  # Fit marginals in parallel
+  fit_results <-  foreach(i = 1:d, .combine = 'cbind', 
+                          .packages = 'sgt') %dopar% {
+                            # Try to fit the model and catch errors/warnings
+                            pp=log_returns_matrix[, i]
+                            result <- tryCatch({
+                              # Fit the marginal model
+                              sgt_fit <- sgt.mle(X.f = ~as.numeric(pp),
+                                                 start = list(mu = mean(pp), 
+                                                              sigma = sd(pp), 
+                                                              lambda = 0, p = 2, q = 2),
+                                                 mean.cent = TRUE, var.adj = TRUE)
+                              est=as.numeric(sgt_fit$estimate)
+                              list(estimate = est, warnings = NULL)  # No warning
+                            }, warning = function(w) {
+                              list(estimate = est, warnings = conditionMessage(w))  # Return warning
+                            }, error = function(e) {
+                              list(estimate = rep(NA,5), warnings = conditionMessage(e))  # Handle error with NA
+                            })
+                            
+                            return(result)  # Return results for each asset
+                          }
+  
+  # Combine estimates and warnings into separate lists
+  parest <- do.call(rbind, fit_results[1,])
+  warnings_sgtfit <- unlist(fit_results[2,])
+  
+  
+  # Populate uniform_marginals using the fit results
+  p_val=numeric(d)
+  for (i in 1:d) {
+    params <- parest[i,]
+    uniform_marginals[, i] <- psgt(log_returns_matrix[, i], 
+                                   mu = params[1], sigma = params[2], 
+                                   lambda = params[3], p = params[4], 
+                                   q = params[5])
+    ad_test <- ad.test(log_returns_matrix[, i], 
+                       function(x) psgt(x, 
+                                        mu = params[1], sigma = params[2], 
+                                        lambda = params[3], p = params[4], 
+                                        q = params[5]))
+    
+    p_val[i]=ad_test$p.value
+  }
+  
+  # Fit the empirical checkerboard copula
+  copula_fit1 <- empCopula(uniform_marginals,smoothing="checkerboard")
+  return(list(copula_fit1,p_val,parest,warnings_sgtfit))
+}
+
+
+####*** Portfolio optimization&&&****
+portfolio.opt <- function(simulated_returns,rolling_window,
+                          next_window) {
+  cov_matrix <- cov(simulated_returns)
+  actual_returns <- colMeans(rolling_window)
+  
+  # Set up quadratic programming problem
+  Dmat <- cov_matrix
+  dvec <- rep(0, ncol(simulated_returns))
+  
+  # Constraints: weights sum to 1 and expected return non-negative 
+  ## optimal weight portfolio > equal weight portfolio
+  Amat <- cbind(1, actual_returns, diag(ncol(simulated_returns)))
+  bvec <- c(1, mean(actual_returns), rep(0, ncol(simulated_returns)))
+  
+  # Solve quadratic programming problem
+  opt_result <- tryCatch({
+    # Attempt to solve the quadratic programming problem
+    result <- solve.QP(Dmat, dvec, Amat, bvec, meq = 1)
+    
+    # Return the result if no error occurs
+    list(result = result, warning = NULL)
+    
+  }, error = function(e) {
+    # Catch and store the error message
+    message("Error in portfolio optimization: ", conditionMessage(e))
+    list(result = NULL, warning = conditionMessage(e))  # Store the error message as a warning
+  }, warning = function(w) {
+    # Catch and store the warning message
+    message("Warning in portfolio optimization: ", conditionMessage(w))
+    list(result = result, warning = conditionMessage(w))  # Store the warning message
+  })
+  
+  
+  weights <- opt_result$result$solution
+  portfolio_return_nextday <- sum(weights * colMeans(next_window))
+  portfolio_variance_nextday <- t(weights) %*% 
+    cov(next_window) %*% weights
+  
+  # Sharpe Ratio (assuming risk-free rate is 0)
+  sharpe_ratio <- portfolio_return_nextday / sqrt(portfolio_variance_nextday)
+  
+  return(list(weights = weights, 
+              return = portfolio_return_nextday, 
+              sharpe_ratio = sharpe_ratio,
+              opt_warning=opt_result$warning))
+}
+
+
+####**** Function to process each rolling window&&***
+rollapply_func <- function(rolling_window, next_window) {
+  copula_fit <- fit.empirical_checkerboard_copula(rolling_window)
+  
+  # Simulate returns from the copula
+  n_simulations <- m
+  simulated_copula <- rCopula(n_simulations, copula_fit[[1]])
+  
+  # Transform back to original marginals
+  simulated_returns <- sapply(1:d, function(i) {
+    params <- copula_fit[[3]][i,]
+    qsgt(simulated_copula[, i], mu = params[1], sigma = params[2], 
+         lambda = params[3], p = params[4], q = params[5])
+  })
+  max_eigen=max(eigen(cov(rolling_window))$values)
+  
+  
+  # Optimize portfolio
+  optimized_portfolio <- portfolio.opt(simulated_returns,
+                                       rolling_window, next_window)
+  
+  # Calculate average return at t+1 i.e. equal weight return for historical data
+  avg_return_t1 <- mean(colMeans(next_window))
+  avg_return_var_t1 <- t(rep((1/d),d)) %*% cov(next_window) %*% rep((1/d),d)
+  sharpe_ratio_t1 <-  avg_return_t1 / sqrt(avg_return_var_t1)
+  
+  # Combine results for optimal portfolio return at t+1
+  return(list(returnweight=c(optimized_portfolio$weights), 
+              optfolio=c(optimized_portfolio$return, 
+                         optimized_portfolio$sharpe_ratio), 
+              eqfolio=c(avg_return_t1,sharpe_ratio_t1),maxeigen=max_eigen,pval= 
+                c(copula_fit[[2]]),warningg=c(copula_fit[[4]],
+                                              optimized_portfolio$opt_warning)))
+}
+
+####**** Run rollapply with parallel processing&&&****
+rolling_results <- foreach(i = 1:(num_windows-1),.combine ='cbind' , 
+                           .packages = c("zoo", "quantmod","foreach",
+                                         "copula", "sgt", "quadprog",
+                                         "ADGofTest"))%dopar% {
+                                           # Rolling window and t+1 window
+                                           roll_window <- returns_matrix[i:(i + window_size - 1), ]
+                                           next_row <- returns_matrix[(i+1):(i + window_size), ]                          
+                                           result <- tryCatch({
+                                             # Assume rollapply_func returns a list containing both numeric and character values
+                                             roll_result <- rollapply_func(roll_window, next_row)
+                                             
+                                             # Extract numeric values (adjust according to the actual structure of roll_result)
+                                             numeric_result <- c(roll_result$returnweight, roll_result$optfolio,
+                                                                 roll_result$eqfolio, 
+                                                                 roll_result$maxeigen, roll_result$pval)
+                                             
+                                             # Extract any warnings or character values (e.g., roll_result$warning contains warnings)
+                                             if(is.null(roll_result$warningg)==F) warning_result <- c(roll_result$warningg)
+                                             if(is.null(roll_result$warningg)==T) warning_result <- NULL#"no warning"
+                                             # Combine numeric and character results into a single vector
+                                             combined_result <- list(numeric_result, warning_result)
+                                             
+                                           }, error = function(e) {
+                                             # In case of an error, return NA for numeric and a generic warning message
+                                             message("Error in iteration ", i, ": ", conditionMessage(e))
+                                             return(combined_result)
+                                           })
+                                           
+                                           return(result)
+                                         }
+
+# Stop the cluster after computation
+stopCluster(cl)
+Sys.time() - strt
+numeric_matrix_out <- do.call(cbind, rolling_results[1,])
+
+# Extract character vectors and combine them into a matrix
+character_matrix_warning <- do.call(rbind, rolling_results[2,])
+
+####**** plot the optimal and equal weigted return and sharpe ratio&&***
+# Extract the 11th and 14th columns for optimal and equal weighted portfolio returns
+optimal_portfolio_return <- t(numeric_matrix_out)[, (d +1)]  # Adjusted for column index
+equal_weighted_portfolio_return <- t(numeric_matrix_out)[, (d +3)]  # Adjusted for column index
+
+# Extract the 12th and 16th columns for optimal and equal weighted sharpe ratios
+optimal_portfolio_sr <- t(numeric_matrix_out)[, (d +2)]  # Adjusted for column index
+equal_weighted_portfolio_sr <- t(numeric_matrix_out)[, (d +4)]  # Adjusted for column index
+
+
+# Create a data frame for plotting returns
+df_returns <- data.frame(
+  Time = 1:length(optimal_portfolio_return),
+  Optimal = optimal_portfolio_return,
+  Equal_Weighted = equal_weighted_portfolio_return
+)
+
+df_returns2 <- data.frame(
+  Time = 1:length(optimal_portfolio_sr),
+  Optimal = optimal_portfolio_sr,
+  Equal_Weighted = equal_weighted_portfolio_sr 
+)
+
+# Plot 1: Line chart for optimal portfolio return vs equal weighted portfolio return
+pl11= ggplot(df_returns, aes(x = Time)) +
+  geom_line(aes(y = Optimal, color = "Optimal Portfolio"), size = .5) +
+  geom_line(aes(y = Equal_Weighted, color = "Equal Weighted Portfolio"), size = .08) +
+  labs(title = "Comparison of Nextday Optimal Portfolio with Other Methods",
+       subtitle = "(i) Returns",
+       x = NULL,
+       y = "Return") +
+  scale_color_manual(values = c("Optimal Portfolio" = "blue", "Equal Weighted Portfolio" = "red")) +
+  theme_minimal(base_size = 8) +
+  theme(legend.title = element_blank(),axis.title = element_text(size = 8),  # Axis titles
+        axis.text = element_text(size = 8),   # Axis text
+        plot.title = element_text(size = 10),
+        legend.position = "none" )
+
+# Plot 2: Line chart for optimal portfolio sharp ratio vs equal weighted portfolio return
+pl1= ggplot(df_returns2, aes(x = Time)) +
+  geom_line(aes(y = Optimal, color = "Optimal Portfolio"), size = .5) +
+  geom_line(aes(y = Equal_Weighted, color = "Equal Weighted Portfolio"), size = .08) +
+  labs(subtitle = "(ii) Sharpe Ratio",
+       x = "Time_window",
+       y = "Sharpe Ratio") +
+  scale_color_manual(values = c("Optimal Portfolio" = "blue", "Equal Weighted Portfolio" = "red")) +
+  theme_minimal(base_size = 8) +
+  theme(legend.title = element_blank(),axis.title = element_text(size = 8),  # Axis titles
+        axis.text = element_text(size = 8),   # Axis text
+        plot.title = element_text(size = 10),
+        legend.position = "none" )
+gg1=ggarrange(pl11,pl1,nrow=2,labels=c("C",""),
+              font.label = list(size = 9),
+              common.legend = T,
+              legend="bottom") 
+gg1
+####****plot the optimal weights and the rolling mean and sd***
+optimal_weights=t(numeric_matrix_out)[, (1:d)]
+# Create a data frame for plotting optimal weights
+df_weights <- data.frame(Time_window = 1:nrow(optimal_weights), 
+                         optimal_weights)
+
+# Melt the data to long format for ggplot
+df_weights_long <- reshape2::melt(df_weights, id.vars = "Time_window",
+                                  variable.name = "Asset", value.name = "Weight")
+
+# Assign asset names to the "Asset" column
+df_weights_long$Asset <- factor(df_weights_long$Asset, 
+                                labels = asset_names)
+
+# Plot 2: Line chart for optimal asset weights
+pl2= ggplot(df_weights_long, aes(x = Time_window, y = Weight, 
+                                 color = Asset)) +
+  geom_line(size = .5) +
+  labs(title = "Rolling Estimated Optimal Weights ",
+       x = "Time_window",
+       y = "Weight") +
+  theme_minimal(base_size = 8) +
+  theme(legend.title = element_blank(),axis.title = element_text(size = 8),  # Axis titles
+        axis.text = element_text(size = 8),   # Axis text
+        plot.title = element_text(size = 10),
+        legend.position = "bottom" )+
+  geom_hline(yintercept = 1/ncol(returns_matrix), linetype = "dashed", color = "black")  # Add horizontal line
+
+# Function to compute rolling returns and standard deviations
+rollapply_func <- function(rolling_window) {
+  stock_returns <- colMeans(rolling_window)   # Mean return for each stock
+  stock_sd <- apply(rolling_window, 2, sd)    # Standard deviation of each stock
+  return(c(stock_returns, stock_sd))
+}
+
+# Use rollapply for rolling calculations
+rolling_resultss <- rollapply(returns_matrix, width = window_size,
+                              FUN = rollapply_func, by.column = FALSE,
+                              align = "right")
+
+# Extract the rolling returns and standard deviations from the results
+rolling_returns <- rolling_resultss[, 1:d]  # First columns are rolling returns of each stock
+rolling_sd <- rolling_resultss[, (d + 1):(2 * d)]  # Next columns are rolling SDs
+
+# (1) Plot Rolling Returns for selected stocks
+df_returns <- data.frame(Time = c(seq(0:(num_windows-1))),
+                         rolling_returns)
+colnames(df_returns)[-1] <- asset_names
+
+p1 <- ggplot(melt(df_returns, id.vars = "Time"),
+             aes(x = Time, y = value, color = variable)) +
+  geom_line(size = .5) +
+  labs(title="Performance Plots",
+       subtitle=" (i) Empirical Rolling Average") +
+  xlab(NULL) +
+  ylab("Rolling Mean") +
+  theme_minimal(base_size = 8) +  # Adjust base font size
+  theme(legend.position = "none",legend.title = element_blank(),  # Hide legend here
+        axis.title = element_text(size = 8),  # Axis titles
+        axis.text = element_text(size = 8),   # Axis text
+        plot.title = element_text(size = 10)) # Title
+
+# (2) Plot Rolling Standard Deviations for selected stocks
+df_sd <- data.frame(Time = c(seq(0:(num_windows-1))),
+                    rolling_sd)
+colnames(df_sd)[-1] <- asset_names
+
+p2 <- ggplot(melt(df_sd, id.vars = "Time"), 
+             aes(x = Time, y = value, color = variable)) +
+  geom_line(size = .5) +
+  labs(title="",subtitle="(ii) Standard Deviations (SD)") +
+  xlab(NULL) +
+  ylab("Rolling SD") +
+  theme_minimal(base_size = 8) +  # Adjust base font size
+  theme(legend.position = "none", legend.title = element_blank(), # Hide legend here
+        axis.title = element_text(size = 8),  # Axis titles
+        axis.text = element_text(size = 8),   # Axis text
+        plot.title = element_text(size = 10)) # Title
+
+p3=   ggarrange(
+  p1,                             # First row with one plot
+  p2,    # Second row with two plots
+  ncol = 2,labels=c("A",""),
+  font.label = list(size = 9)
+  # Add a common legend
+  # Position the legend at the bottom
+)
+
+gg2=  ggarrange(p3,pl2,nrow=2,common.legend = T,
+                labels=c("","B"),
+                font.label = list(size = 9),
+                legend="bottom")
+
+gg2
+
+###*** avg of all rolling windows ad.test p-value of sgt fit***
+p_valuee=colMeans(t(numeric_matrix_out)[,-c(1:(d+5))])
+p_valuee
+
+## total run time
+Sys.time()-strt
+
+```
+
+
